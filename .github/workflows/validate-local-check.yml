@@ -1,0 +1,32 @@
+name: Validate local-check wrapper
+
+on:
+  push:
+    branches:
+      - fix/antigravity-cli-csrf
+
+permissions:
+  contents: read
+
+jobs:
+  local-check:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run repository local check
+        shell: powershell
+        run: powershell.exe -ExecutionPolicy Bypass -NoProfile -File scripts\local-check.ps1
