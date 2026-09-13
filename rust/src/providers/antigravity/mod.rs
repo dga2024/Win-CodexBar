@@ -35,6 +35,7 @@ use crate::core::{
 
 const AGY_NOT_FOUND_MESSAGE: &str =
     "Antigravity is not running and the signed-in agy CLI was not found.";
+const ANTIGRAVITY_CSRF_TOKEN_ENV: &str = "ANTIGRAVITY_CSRF_TOKEN";
 #[cfg(windows)]
 const AGY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(windows)]
@@ -75,13 +76,15 @@ fn flag_re(flag: &str) -> Regex {
 ///
 /// The desktop IDE/app language server authenticates local requests with a
 /// `--csrf_token` flag and requires the `X-Codeium-Csrf-Token` header. The
-/// `agy` CLI hosts the same language server in-process but launches it without
-/// that flag and serves the quota endpoints with no CSRF header.
+/// `agy` CLI hosts the same language server in-process without exposing that
+/// flag on its command line. Historically its quota endpoints were tokenless,
+/// but some CLI builds require a CSRF header; those can use the explicit
+/// `ANTIGRAVITY_CSRF_TOKEN` override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessSource {
     /// Desktop IDE/app language server — requires a CSRF token.
     Ide,
-    /// `agy` CLI language server — no CSRF token required.
+    /// `agy` CLI language server — tokenless unless an explicit token is supplied.
     Cli,
 }
 
@@ -165,9 +168,9 @@ impl AntigravityProvider {
         let https_port_re = flag_re("https_server_port");
 
         // Prefer desktop IDE/app matches (which carry a --csrf_token) over the
-        // tokenless `agy` CLI so the CSRF-protected endpoint is used when both
-        // happen to be running. Only fall back to a CLI match when no IDE match
-        // is found, mirroring upstream's process-kind precedence.
+        // agy CLI so the directly discoverable CSRF-protected endpoint is used
+        // when both happen to be running. Only fall back to a CLI match when no
+        // IDE match is found, mirroring upstream's process-kind precedence.
         let mut cli_match: Option<ProcessInfo> = None;
 
         for line in stdout.lines() {
@@ -210,8 +213,9 @@ impl AntigravityProvider {
                 });
             }
 
-            // `agy` CLI: hosts the same language server without --csrf_token.
-            // Allow an empty CSRF token; the CLI's quota endpoint requires none.
+            // `agy` CLI: its command line does not expose --csrf_token. Keep the
+            // process token empty; fetch_local_payload may supply an explicit
+            // ANTIGRAVITY_CSRF_TOKEN override when a CLI build requires one.
             if cli_match.is_none() && is_agy_cli_command(line) {
                 cli_match = Some(ProcessInfo {
                     csrf_token: String::new(),
@@ -526,8 +530,8 @@ impl AntigravityProvider {
                             .await
                             {
                                 Ok(Ok(usage)) => return Ok(ManagedAgyOutcome::Fetched(usage)),
-                                Ok(Err(ProviderError::AuthRequired)) => {
-                                    return Err(ProviderError::AuthRequired);
+                                Ok(Err(error)) if Self::should_surface_probe_failure(&error) => {
+                                    return Err(error);
                                 }
                                 Ok(Err(error)) => last_error = Some(error),
                                 Err(_) => break,
@@ -598,18 +602,22 @@ impl AntigravityProvider {
 
     /// Resolve a failure to obtain live usage.
     ///
-    /// A failed sign-in is actionable, so it always surfaces. Every other
-    /// failure means the runtime/CLI is unavailable or inconclusive, so an
-    /// available offline conversation-history snapshot is preferred over
-    /// discarding it for a transient error.
+    /// Authentication failures and an explicit missing-CSRF diagnostic are
+    /// actionable, so they always surface. Other local probe failures may fall
+    /// back to available offline conversation history.
     fn resolve_probe_failure(
         error: ProviderError,
         offline: Option<ProviderFetchResult>,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        if matches!(error, ProviderError::AuthRequired) {
+        if Self::should_surface_probe_failure(&error) {
             return Err(error);
         }
         offline.ok_or(error)
+    }
+
+    fn should_surface_probe_failure(error: &ProviderError) -> bool {
+        matches!(error, ProviderError::AuthRequired)
+            || error.to_string().contains(ANTIGRAVITY_CSRF_TOKEN_ENV)
     }
 
     /// Map a managed-lifecycle outcome onto provider policy.
@@ -635,7 +643,7 @@ impl AntigravityProvider {
             ))),
             Ok(ManagedAgyOutcome::Missing) => Ok(None),
             Err(error) => {
-                if !matches!(error, ProviderError::AuthRequired) {
+                if !Self::should_surface_probe_failure(&error) {
                     tracing::debug!(%error, "managed Antigravity CLI probe failed");
                 }
                 Self::resolve_probe_failure(error, Self::offline_usage_result()).map(Some)
@@ -684,6 +692,51 @@ impl AntigravityProvider {
         candidates
     }
 
+    fn cli_csrf_token_override() -> Option<String> {
+        std::env::var(ANTIGRAVITY_CSRF_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn csrf_token_for_request<'a>(
+        process_info: &'a ProcessInfo,
+        cli_override: Option<&'a str>,
+    ) -> Option<&'a str> {
+        match process_info.source {
+            ProcessSource::Ide => process_info
+                .extension_server_csrf_token
+                .as_deref()
+                .or_else(|| (!process_info.csrf_token.is_empty()).then_some(process_info.csrf_token.as_str())),
+            ProcessSource::Cli => cli_override.map(str::trim).filter(|value| !value.is_empty()),
+        }
+    }
+
+    fn with_csrf_header(
+        request: reqwest::RequestBuilder,
+        process_info: &ProcessInfo,
+        cli_override: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        match Self::csrf_token_for_request(process_info, cli_override) {
+            Some(token) => request.header("X-Codeium-Csrf-Token", token),
+            None => request,
+        }
+    }
+
+    fn cli_csrf_error(status: reqwest::StatusCode, text: &str) -> Option<ProviderError> {
+        let missing_csrf = text.to_ascii_lowercase().contains("missing csrf token");
+        if !missing_csrf
+            || (status != reqwest::StatusCode::UNAUTHORIZED
+                && status != reqwest::StatusCode::FORBIDDEN)
+        {
+            return None;
+        }
+
+        Some(ProviderError::Other(format!(
+            "Antigravity CLI rejected the local quota request because a CSRF token is required. Set {ANTIGRAVITY_CSRF_TOKEN_ENV} to the active agy CSRF token and retry. API error {status}: {text}"
+        )))
+    }
+
     async fn fetch_local_payload(
         client: &reqwest::Client,
         process_info: &ProcessInfo,
@@ -693,21 +746,16 @@ impl AntigravityProvider {
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, ProviderError> {
         let url = format!("https://127.0.0.1:{api_port}{path}");
-        let requires_csrf = process_info.source == ProcessSource::Ide;
-        let csrf_token = process_info
-            .extension_server_csrf_token
-            .as_deref()
-            .unwrap_or(&process_info.csrf_token);
-        let mut request = client
+        let cli_csrf_token = (process_info.source == ProcessSource::Cli)
+            .then(Self::cli_csrf_token_override)
+            .flatten();
+        let request = client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Connect-Protocol-Version", "1")
             .timeout(timeout)
             .json(body);
-        if requires_csrf {
-            request = request.header("X-Codeium-Csrf-Token", csrf_token);
-        }
-        let response = request
+        let response = Self::with_csrf_header(request, process_info, cli_csrf_token.as_deref())
             .send()
             .await
             .map_err(|e| ProviderError::Other(format!("API request failed: {e}")))?;
@@ -721,7 +769,9 @@ impl AntigravityProvider {
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        if requires_csrf && process_info.extension_server_csrf_token.is_some() {
+        if process_info.source == ProcessSource::Ide
+            && process_info.extension_server_csrf_token.is_some()
+        {
             let retry = client
                 .post(&url)
                 .header("Content-Type", "application/json")
@@ -742,14 +792,18 @@ impl AntigravityProvider {
             }
         }
 
-        if process_info.source == ProcessSource::Cli
-            && (status == reqwest::StatusCode::UNAUTHORIZED
+        if process_info.source == ProcessSource::Cli {
+            if let Some(error) = Self::cli_csrf_error(status, &text) {
+                return Err(error);
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
                 || text.to_ascii_lowercase().contains("not logged")
                 || text.to_ascii_lowercase().contains("login method")
-                || text.to_ascii_lowercase().contains("keyring"))
-        {
-            return Err(ProviderError::AuthRequired);
+                || text.to_ascii_lowercase().contains("keyring")
+            {
+                return Err(ProviderError::AuthRequired);
+            }
         }
         Err(ProviderError::Other(format!("API error {status}: {text}")))
     }
@@ -926,7 +980,7 @@ impl Provider for AntigravityProvider {
             Err(error) => {
                 // The local probe is inconclusive (e.g. PowerShell unavailable);
                 // preserve offline history before surfacing the probe error.
-                if !matches!(error, ProviderError::AuthRequired) {
+                if !Self::should_surface_probe_failure(&error) {
                     tracing::debug!(%error, "Antigravity local probe failed");
                 }
                 Self::resolve_probe_failure(error, Self::offline_usage_result())
@@ -963,8 +1017,8 @@ struct ProcessInfo {
     extension_server_csrf_token: Option<String>,
     extension_port: Option<u16>,
     pid: Option<u32>,
-    /// Whether the process is the desktop IDE/app server (CSRF required) or the
-    /// `agy` CLI (no CSRF). See [`ProcessSource`].
+    /// Whether the process is the desktop IDE/app server or the `agy` CLI.
+    /// CLI requests remain tokenless unless an explicit CSRF override exists.
     source: ProcessSource,
 }
 
@@ -1220,3 +1274,7 @@ fn clean_model_label(label: &str) -> String {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "csrf_tests.rs"]
+mod csrf_tests;
