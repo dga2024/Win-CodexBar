@@ -3,6 +3,7 @@
 //! Fetches usage data from Antigravity's local language server probe
 //! Uses Windows process detection to find CSRF token
 
+mod cli_csrf;
 mod local_proto;
 pub mod local_sessions;
 mod local_sqlite;
@@ -46,6 +47,7 @@ const AGY_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const GET_USER_STATUS_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
 const QUOTA_SUMMARY_PATH: &str =
     "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+const CLI_CSRF_REQUIRED_PREFIX: &str = "Antigravity CLI CSRF token required";
 
 /// Serialize task-owned `agy` launches so concurrent app surfaces never start
 /// multiple interactive CLI servers at the same time.
@@ -73,15 +75,15 @@ fn flag_re(flag: &str) -> Regex {
 
 /// The kind of local Antigravity process a `ProcessInfo` was derived from.
 ///
-/// The desktop IDE/app language server authenticates local requests with a
-/// `--csrf_token` flag and requires the `X-Codeium-Csrf-Token` header. The
-/// `agy` CLI hosts the same language server in-process but launches it without
-/// that flag and serves the quota endpoints with no CSRF header.
+/// The desktop IDE/app language server advertises a CSRF token on its command
+/// line. The `agy` CLI does not, so older builds remain tokenless while newer
+/// CSRF-protected builds can be retried with a token discovered from the local
+/// hub index page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessSource {
     /// Desktop IDE/app language server — requires a CSRF token.
     Ide,
-    /// `agy` CLI language server — no CSRF token required.
+    /// `agy` CLI language server — may be tokenless or CSRF-protected.
     Cli,
 }
 
@@ -165,9 +167,9 @@ impl AntigravityProvider {
         let https_port_re = flag_re("https_server_port");
 
         // Prefer desktop IDE/app matches (which carry a --csrf_token) over the
-        // tokenless `agy` CLI so the CSRF-protected endpoint is used when both
-        // happen to be running. Only fall back to a CLI match when no IDE match
-        // is found, mirroring upstream's process-kind precedence.
+        // agy CLI so the directly discoverable CSRF-protected endpoint is used
+        // when both happen to be running. Only fall back to a CLI match when no
+        // IDE match is found, mirroring upstream's process-kind precedence.
         let mut cli_match: Option<ProcessInfo> = None;
 
         for line in stdout.lines() {
@@ -210,8 +212,10 @@ impl AntigravityProvider {
                 });
             }
 
-            // `agy` CLI: hosts the same language server without --csrf_token.
-            // Allow an empty CSRF token; the CLI's quota endpoint requires none.
+            // `agy` CLI does not expose --csrf_token on its command line. Keep
+            // the token empty here; the request path preserves tokenless CLI
+            // compatibility and discovers a local hub token only after a server
+            // explicitly reports that CSRF is required.
             if cli_match.is_none() && is_agy_cli_command(line) {
                 cli_match = Some(ProcessInfo {
                     csrf_token: String::new(),
@@ -346,18 +350,18 @@ impl AntigravityProvider {
                     "Failed to join the Antigravity process detector: {error}"
                 ))
             })??;
-        let Some(process_info) = process_info else {
+        let Some(mut process_info) = process_info else {
             return Ok(None);
         };
         let api_port = Self::find_api_port(process_info.extension_port, process_info.pid).await?;
-        self.fetch_user_status_at_port(&process_info, api_port)
+        self.fetch_user_status_at_port(&mut process_info, api_port)
             .await
             .map(Some)
     }
 
     async fn fetch_user_status_at_port(
         &self,
-        process_info: &ProcessInfo,
+        process_info: &mut ProcessInfo,
         api_port: u16,
     ) -> Result<UsageSnapshot, ProviderError> {
         // SECURITY: TLS verification disabled only for this loopback language server.
@@ -493,7 +497,7 @@ impl AntigravityProvider {
         };
         let mut managed = ManagedProcess::spawn(&config)?;
         let pid = managed.pid();
-        let process_info = ProcessInfo {
+        let mut process_info = ProcessInfo {
             csrf_token: String::new(),
             extension_server_csrf_token: None,
             extension_port: None,
@@ -521,7 +525,7 @@ impl AntigravityProvider {
                             }
                             match tokio::time::timeout(
                                 remaining,
-                                self.fetch_user_status_at_port(&process_info, port),
+                                self.fetch_user_status_at_port(&mut process_info, port),
                             )
                             .await
                             {
@@ -606,7 +610,13 @@ impl AntigravityProvider {
         error: ProviderError,
         offline: Option<ProviderFetchResult>,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        if matches!(error, ProviderError::AuthRequired) {
+        if matches!(error, ProviderError::AuthRequired)
+            || matches!(
+                &error,
+                ProviderError::Other(message)
+                    if message.starts_with(CLI_CSRF_REQUIRED_PREFIX)
+            )
+        {
             return Err(error);
         }
         offline.ok_or(error)
@@ -684,62 +694,144 @@ impl AntigravityProvider {
         candidates
     }
 
+    async fn send_local_request(
+        client: &reqwest::Client,
+        url: &str,
+        body: &serde_json::Value,
+        timeout: std::time::Duration,
+        csrf_token: Option<&str>,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut request = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .timeout(timeout)
+            .json(body);
+        if let Some(token) = csrf_token.filter(|token| !token.trim().is_empty()) {
+            request = request.header("X-Codeium-Csrf-Token", token);
+        }
+        request
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other(format!("API request failed: {e}")))
+    }
+
+    async fn response_bytes(response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| ProviderError::Other(format!("Failed to read response: {e}")))
+    }
+
     async fn fetch_local_payload(
         client: &reqwest::Client,
-        process_info: &ProcessInfo,
+        process_info: &mut ProcessInfo,
         api_port: u16,
         path: &str,
         body: &serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, ProviderError> {
         let url = format!("https://127.0.0.1:{api_port}{path}");
-        let requires_csrf = process_info.source == ProcessSource::Ide;
-        let csrf_token = process_info
-            .extension_server_csrf_token
-            .as_deref()
-            .unwrap_or(&process_info.csrf_token);
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Connect-Protocol-Version", "1")
-            .timeout(timeout)
-            .json(body);
-        if requires_csrf {
-            request = request.header("X-Codeium-Csrf-Token", csrf_token);
+
+        // An explicit override is useful for diagnostics and unusual CLI builds,
+        // but it is never required for historically tokenless agy instances.
+        if process_info.source == ProcessSource::Cli
+            && process_info.csrf_token.is_empty()
+            && let Some(token) = cli_csrf::token_override()
+        {
+            process_info.csrf_token = token;
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other(format!("API request failed: {e}")))?;
+
+        let response = Self::send_local_request(
+            client,
+            &url,
+            body,
+            timeout,
+            process_info.request_csrf_token(),
+        )
+        .await?;
         if response.status().is_success() {
-            return response
-                .bytes()
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| ProviderError::Other(format!("Failed to read response: {e}")));
+            return Self::response_bytes(response).await;
         }
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        if requires_csrf && process_info.extension_server_csrf_token.is_some() {
-            let retry = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Connect-Protocol-Version", "1")
-                .header("X-Codeium-Csrf-Token", &process_info.csrf_token)
-                .timeout(timeout)
-                .json(body)
-                .send()
-                .await;
+
+        // The desktop IDE can advertise an extension-server token as well as
+        // its primary token. Preserve the existing primary-token retry.
+        if process_info.source == ProcessSource::Ide
+            && process_info.extension_server_csrf_token.is_some()
+            && !process_info.csrf_token.is_empty()
+        {
+            let retry = Self::send_local_request(
+                client,
+                &url,
+                body,
+                timeout,
+                Some(&process_info.csrf_token),
+            )
+            .await;
             if let Ok(retry) = retry
                 && retry.status().is_success()
             {
-                return retry
-                    .bytes()
-                    .await
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|e| ProviderError::Other(format!("Failed to read response: {e}")));
+                return Self::response_bytes(retry).await;
             }
+        }
+
+        // Preserve old tokenless CLI behavior. Only when the running agy
+        // explicitly rejects the request for a missing CSRF token do we inspect
+        // that same process's loopback listeners for its published hub token and
+        // retry once. The discovered token stays only in this ProcessInfo so the
+        // following identity request can reuse it without another discovery.
+        if process_info.source == ProcessSource::Cli
+            && cli_csrf::missing_token_response(status, &text)
+        {
+            let mut ports = vec![api_port];
+            if let Some(pid) = process_info.pid
+                && let Ok(listeners) = Self::listening_ports_for_pid(pid)
+            {
+                for port in listeners {
+                    if !ports.contains(&port) {
+                        ports.push(port);
+                    }
+                }
+            }
+            if let Some(token) = cli_csrf::discover_token(client, ports).await {
+                process_info.csrf_token = token;
+                let retry = Self::send_local_request(
+                    client,
+                    &url,
+                    body,
+                    timeout,
+                    process_info.request_csrf_token(),
+                )
+                .await?;
+                if retry.status().is_success() {
+                    return Self::response_bytes(retry).await;
+                }
+                let retry_status = retry.status();
+                let retry_text = retry.text().await.unwrap_or_default();
+                if cli_csrf::missing_token_response(retry_status, &retry_text) {
+                    return Err(ProviderError::Other(format!(
+                        "{CLI_CSRF_REQUIRED_PREFIX}: the discovered token was rejected by agy ({retry_status}: {retry_text})"
+                    )));
+                }
+                if retry_status == reqwest::StatusCode::UNAUTHORIZED
+                    || retry_status == reqwest::StatusCode::FORBIDDEN
+                    || retry_text.to_ascii_lowercase().contains("not logged")
+                    || retry_text.to_ascii_lowercase().contains("login method")
+                    || retry_text.to_ascii_lowercase().contains("keyring")
+                {
+                    return Err(ProviderError::AuthRequired);
+                }
+                return Err(ProviderError::Other(format!(
+                    "API error {retry_status}: {retry_text}"
+                )));
+            }
+            return Err(ProviderError::Other(format!(
+                "{CLI_CSRF_REQUIRED_PREFIX}: agy rejected the local quota request ({status}: {text}); no token could be discovered. Set ANTIGRAVITY_CSRF_TOKEN to an active agy token or retry after restarting agy."
+            )));
         }
 
         if process_info.source == ProcessSource::Cli
@@ -963,9 +1055,16 @@ struct ProcessInfo {
     extension_server_csrf_token: Option<String>,
     extension_port: Option<u16>,
     pid: Option<u32>,
-    /// Whether the process is the desktop IDE/app server (CSRF required) or the
-    /// `agy` CLI (no CSRF). See [`ProcessSource`].
+    /// Whether the process is the desktop IDE/app server or the `agy` CLI.
     source: ProcessSource,
+}
+
+impl ProcessInfo {
+    fn request_csrf_token(&self) -> Option<&str> {
+        self.extension_server_csrf_token
+            .as_deref()
+            .or_else(|| (!self.csrf_token.trim().is_empty()).then_some(self.csrf_token.as_str()))
+    }
 }
 
 #[cfg(windows)]
@@ -1220,3 +1319,7 @@ fn clean_model_label(label: &str) -> String {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "csrf_tests.rs"]
+mod csrf_tests;
